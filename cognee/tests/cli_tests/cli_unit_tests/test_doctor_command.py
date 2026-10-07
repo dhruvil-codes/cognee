@@ -141,3 +141,141 @@ class TestDoctorCommand:
             DoctorCommand().execute(_make_args())
         assert disable_level_during_check == [logging.ERROR]
         assert logging.root.manager.disable == logging.NOTSET
+
+
+# ── environment checks (issue #5464) ────────────────────────────────────────
+# Each helper is pure given its inputs (env vars, shutil.which, find_spec are
+# all monkeypatched), and only "fail" statuses count toward the exit code —
+# keyless mode and missing Node/Docker are warnings, not failures.
+
+
+def test_python_version_passes_within_supported_range():
+    from cognee.cli.commands.doctor_command import _check_python
+
+    status, message = _check_python((3, 12, 1))
+    assert status == "pass"
+    assert "3.12.1" in message
+    assert "3.10–3.14" in message
+
+
+@pytest.mark.parametrize("version", [(3, 9, 7), (3, 15, 0), (4, 0, 0), (3, 10, 0), (3, 14, 3)])
+def test_python_version_boundaries(version):
+    from cognee.cli.commands.doctor_command import _check_python
+
+    expected = "pass" if (3, 10) <= version[:2] <= (3, 14) else "fail"
+    assert _check_python(version)[0] == expected
+
+
+def test_cognee_version_reports_installed_version():
+    from cognee.cli.commands.doctor_command import _check_cognee_version
+
+    status, message = _check_cognee_version()
+    assert status == "pass"
+    assert "cognee" in message
+
+
+def test_llm_api_key_set_is_reported_without_revealing_the_value(monkeypatch):
+    from cognee.cli.commands.doctor_command import _check_llm_api_key
+
+    monkeypatch.setenv("LLM_API_KEY", "sk-super-secret-value-123")
+    status, message = _check_llm_api_key()
+    assert status == "pass"
+    assert "sk-super-secret-value-123" not in message
+    assert "set" in message
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_llm_api_key_missing_or_blank_warns_keyless(monkeypatch, value):
+    from cognee.cli.commands.doctor_command import _check_llm_api_key
+
+    if value is None:
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("LLM_API_KEY", value)
+    status, message = _check_llm_api_key()
+    assert status == "warn"
+    assert "keyless" in message
+
+
+def test_gliner_importable_passes(monkeypatch):
+    import importlib.util
+    import types
+
+    from cognee.cli.commands.doctor_command import _check_gliner
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: types.SimpleNamespace(name=name))
+    assert _check_gliner() == ("pass", "gliner extra installed")
+
+
+def test_gliner_missing_warns_with_install_hint(monkeypatch):
+    import importlib.util
+
+    from cognee.cli.commands.doctor_command import _check_gliner
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    status, message = _check_gliner()
+    assert status == "warn"
+    assert "cognee[gliner]" in message
+
+
+def test_node_npm_and_docker_present_pass(monkeypatch):
+    import shutil
+
+    from cognee.cli.commands.doctor_command import _check_ui_and_mcp_tools
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    checks = _check_ui_and_mcp_tools()
+    assert len(checks) == 2
+    assert all(status == "pass" for status, _ in checks)
+
+
+def test_missing_node_and_docker_warn_with_hints(monkeypatch):
+    import shutil
+
+    from cognee.cli.commands.doctor_command import _check_ui_and_mcp_tools
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    checks = _check_ui_and_mcp_tools()
+    assert len(checks) == 2
+    assert all(status == "warn" for status, _ in checks)
+    assert any("cognee-cli -ui" in message for _, message in checks)
+    assert any("MCP" in message for _, message in checks)
+
+
+def test_environment_failure_fails_the_command_with_nonzero_exit(monkeypatch, stub_configs):
+    """Only environment FAILURES (not warnings) flip the exit code."""
+    import cognee.api.v1.health.health as health_module
+    import cognee.cli.commands.doctor_command as doctor_module
+
+    monkeypatch.setattr(
+        doctor_module, "_check_python", lambda: ("fail", "Python 3.9.7 (supported: 3.10–3.14)")
+    )
+    monkeypatch.setattr(
+        health_module.health_checker,
+        "get_health_status",
+        AsyncMock(return_value=_healthy_response()),
+    )
+    with pytest.raises(CliCommandException) as exc_info:
+        DoctorCommand().execute(_make_args())
+    assert exc_info.value.error_code == 1
+
+
+def test_environment_warnings_alone_do_not_fail_the_command(monkeypatch, stub_configs):
+    """Keyless mode + missing Node/Docker are warnings: doctor must still exit 0."""
+    import cognee.api.v1.health.health as health_module
+    import cognee.cli.commands.doctor_command as doctor_module
+
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setattr(doctor_module, "_check_python", lambda: ("pass", "Python 3.12.1"))
+    monkeypatch.setattr(doctor_module, "_check_gliner", lambda: ("warn", "gliner missing"))
+    monkeypatch.setattr(
+        doctor_module,
+        "_check_ui_and_mcp_tools",
+        lambda: [("warn", "Node.js/npm not found"), ("warn", "Docker not found")],
+    )
+    monkeypatch.setattr(
+        health_module.health_checker,
+        "get_health_status",
+        AsyncMock(return_value=_healthy_response()),
+    )
+    DoctorCommand().execute(_make_args())  # no raise

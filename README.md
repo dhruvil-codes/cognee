@@ -161,6 +161,14 @@ cognee-cli demo
 
 This command works with the base `pip install cognee` package. It loads bundled sample data and runs keyword search without an API key. Use the local quickstart above to build a graph from your own text.
 
+Before your first real run — or when reporting a problem — verify your local setup with:
+
+```bash
+cognee-cli doctor
+```
+
+It prints a pass/warn/fail report covering the supported Python range (3.10–3.14), the installed cognee version, whether `LLM_API_KEY` is set (never printing it), the `gliner` extra, and Node.js/Docker availability for the UI and MCP service, then exits non-zero if anything actually failed.
+
 
 
 ## How Cognee works

@@ -1,6 +1,11 @@
 import argparse
 import asyncio
+import importlib.metadata
+import importlib.util
 import logging
+import os
+import shutil
+import sys
 from contextlib import contextmanager
 
 import cognee.cli.echo as fmt
@@ -24,6 +29,61 @@ def _suppressed_error_logs():
         logging.disable(logging.NOTSET)
 
 
+# Environment checks (zero network, hermetic). Each returns (status, message)
+# with status one of "pass" / "warn" / "fail"; only failures fail the command.
+# Messages never embed secret values.
+_SUPPORTED_PYTHON_RANGE = ((3, 10), (3, 14))
+
+
+def _check_python(version: tuple[int, int, int] | None = None) -> tuple[str, str]:
+    """Pass while the running Python is within the supported 3.10–3.14 range."""
+    version = version or tuple(sys.version_info[:3])
+    low, high = _SUPPORTED_PYTHON_RANGE
+    detail = f"Python {version[0]}.{version[1]}.{version[2]} (supported: 3.10–3.14)"
+    return ("pass" if low <= version[:2] <= high else "fail"), detail
+
+
+def _check_cognee_version() -> tuple[str, str]:
+    try:
+        version = importlib.metadata.version("cognee")
+    except importlib.metadata.PackageNotFoundError:
+        return "fail", "cognee package metadata not found (broken or non-uv install?)"
+    return "pass", f"cognee {version} installed"
+
+
+def _check_llm_api_key() -> tuple[str, str]:
+    if (os.environ.get("LLM_API_KEY") or "").strip():
+        # Never echo the key itself.
+        return "pass", "LLM_API_KEY is set (value hidden)"
+    return (
+        "warn",
+        "LLM_API_KEY not set — running in keyless mode (LLM-dependent stages will be skipped)",
+    )
+
+
+def _check_gliner() -> tuple[str, str]:
+    # find_spec only — importing gliner2 pulls torch, which doctor must not do.
+    if importlib.util.find_spec("gliner2") is not None:
+        return "pass", "gliner extra installed"
+    return (
+        "warn",
+        'gliner extra not installed — keyless graph extraction unavailable (pip install "cognee[gliner]")',
+    )
+
+
+def _check_ui_and_mcp_tools() -> list[tuple[str, str]]:
+    checks: list[tuple[str, str]] = []
+    if shutil.which("node") and shutil.which("npm"):
+        checks.append(("pass", "node and npm found"))
+    else:
+        checks.append(("warn", "Node.js/npm not found — required for `cognee-cli -ui`"))
+    if shutil.which("docker"):
+        checks.append(("pass", "docker found"))
+    else:
+        checks.append(("warn", "Docker not found — required for the MCP service"))
+    return checks
+
+
 class DoctorCommand(SupportsCliCommand):
     """Diagnose cognee configuration and local services before first use."""
 
@@ -33,6 +93,10 @@ class DoctorCommand(SupportsCliCommand):
     description = """
 The `doctor` command runs preflight diagnostics and prints a pass/fail report:
 
+0. Environment — Python version range, installed cognee version, whether
+   LLM_API_KEY is set (never printed), gliner extra importability, and
+   Node.js/npm + Docker availability for the UI and MCP service. Warnings
+   here (keyless mode, missing Node/Docker) do not fail the command.
 1. Provider configuration consistency — catches the only-LLM-or-only-embeddings
    trap where the unconfigured side silently defaults to OpenAI and breaks
    minutes into the first ingestion.
@@ -62,6 +126,26 @@ Exits non-zero when any check fails, so it can gate CI and setup scripts.
 
     async def _run(self, probe: bool) -> int:
         failures = 0
+
+        # --- 0. Environment (zero network; warnings never fail the command) ---
+        fmt.bold("Environment")
+        env_checks: list[tuple[str, str]] = [
+            _check_python(),
+            _check_cognee_version(),
+            _check_llm_api_key(),
+            _check_gliner(),
+            *_check_ui_and_mcp_tools(),
+        ]
+        _glyphs = {"pass": "✓", "warn": "⚠️", "fail": "✗"}
+        for status, message in env_checks:
+            line = f"  {_glyphs[status]} {message}"
+            if status == "fail":
+                fmt.error(line)
+                failures += 1
+            elif status == "warn":
+                fmt.echo(line, color="yellow")
+            else:
+                fmt.echo(line)
 
         # --- 1. Provider configuration consistency (zero network) ---
         fmt.bold("Configuration")
